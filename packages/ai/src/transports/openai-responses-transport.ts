@@ -50,7 +50,6 @@ import {
   isImageWithMediaPayload,
   stripSystemPromptCacheBoundary,
 } from "../internal/shared.js";
-import { createAssistantMessageEventStream } from "../utils/event-stream.js";
 import {
   buildGuardedModelFetch,
   resolveOpenAIStrictToolSetting,
@@ -92,7 +91,10 @@ import {
 } from "./openai-transport-shared.js";
 import { sanitizeResponsesImagePayload } from "./responses-image-payload-sanitizer.js";
 import {
-  assignTransportErrorDetails,
+  createEmptyTransportUsage,
+  createWritableTransportEventStream,
+  failTransportStream,
+  finalizeTransportStream,
   mergeTransportMetadata,
   sanitizeNonEmptyTransportPayloadText,
   sanitizeTransportPayloadText,
@@ -1818,26 +1820,47 @@ function createOpenAIResponsesClient(
   });
 }
 
-export function createOpenAIResponsesTransportStreamFn(): StreamFn {
-  return (model, context, options) => {
-    const responsesOptions = options as OpenAIResponsesOptions | undefined;
-    const eventStream = createAssistantMessageEventStream();
-    const stream = eventStream as unknown as { push(event: unknown): void; end(): void };
+type ResponsesTransportExecutorConfig<Client> = {
+  outputApi?: Api;
+  createClient: (params: {
+    model: Model;
+    context: Context;
+    apiKey: string;
+    headers?: Record<string, string>;
+    turnHeaders?: Record<string, string>;
+    sessionId?: string;
+  }) => Client;
+  buildRequest: (params: {
+    model: Model;
+    context: Context;
+    options?: OpenAIResponsesOptions;
+    metadata?: Record<string, string>;
+  }) => OpenAIResponsesRequestParams;
+  createResponseStream: (params: {
+    client: Client;
+    request: OpenAIResponsesRequestParams;
+    requestOptions: ReturnType<typeof buildOpenAISdkRequestOptions>;
+    model: Model;
+  }) => Promise<AsyncIterable<unknown>>;
+  sdkRequestOptions?: { stream?: boolean };
+  defaultFirstEventTimeoutMs?: number;
+  applyServiceTierPricing?: typeof applyServiceTierPricing;
+};
+
+function createResponsesTransportExecutor<Client>(
+  config: ResponsesTransportExecutorConfig<Client>,
+): StreamFn {
+  return (model, context, rawOptions) => {
+    const options = rawOptions as OpenAIResponsesOptions | undefined;
+    const { eventStream, stream } = createWritableTransportEventStream();
     void (async () => {
       const output: MutableAssistantOutput = {
-        role: "assistant" as const,
+        role: "assistant",
         content: [],
-        api: model.api,
+        api: config.outputApi ?? model.api,
         provider: model.provider,
         model: model.id,
-        usage: {
-          input: 0,
-          output: 0,
-          cacheRead: 0,
-          cacheWrite: 0,
-          totalTokens: 0,
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-        },
+        usage: createEmptyTransportUsage(),
         stopReason: "stop",
         timestamp: Date.now(),
       };
@@ -1850,53 +1873,58 @@ export function createOpenAIResponsesTransportStreamFn(): StreamFn {
           attempt: 1,
           transport: "stream",
         });
-        const client = createOpenAIResponsesClient(
+        const client = config.createClient({
           model,
           context,
           apiKey,
-          options?.headers,
-          turnState?.headers,
-          options?.sessionId,
-        );
-        let params = buildOpenAIResponsesParams(
+          headers: options?.headers,
+          turnHeaders: turnState?.headers,
+          sessionId: options?.sessionId,
+        });
+        let request = config.buildRequest({
           model,
           context,
-          responsesOptions,
-          turnState?.metadata,
-        );
-        const nextParams = await options?.onPayload?.(params, model);
-        if (nextParams !== undefined) {
-          params = nextParams as typeof params;
+          options,
+          metadata: turnState?.metadata,
+        });
+        const nextRequest = await options?.onPayload?.(request, model);
+        if (nextRequest !== undefined) {
+          request = nextRequest as typeof request;
         }
         if (!isOpenAICodexResponsesModel(model)) {
-          params = mergeTransportMetadata(params, turnState?.metadata);
+          request = mergeTransportMetadata(request, turnState?.metadata);
         }
-        params = sanitizeOpenAICodexResponsesParams(
+        request = sanitizeOpenAICodexResponsesParams(
           model,
-          params as Record<string, unknown>,
-        ) as typeof params;
-        params = sanitizeResponsesImagePayload(params as Record<string, unknown>) as typeof params;
+          request as Record<string, unknown>,
+        ) as typeof request;
+        request = sanitizeResponsesImagePayload(
+          request as Record<string, unknown>,
+        ) as typeof request;
         if (
           (options as { openclawCodeModeToolSurface?: unknown } | undefined)
             ?.openclawCodeModeToolSurface === true
         ) {
-          enforceCodeModeResponsesToolSurface(params);
-          assertCodeModeResponsesToolSurface(params);
+          enforceCodeModeResponsesToolSurface(request);
+          assertCodeModeResponsesToolSurface(request);
         }
+
         const requestStartedAt = Date.now();
         firstEventAbort = createFirstStreamEventAbortController(options?.signal);
-        const requestOptions = buildOpenAISdkRequestOptions(model, firstEventAbort.signal, {
-          stream: true,
-        });
+        const requestOptions = buildOpenAISdkRequestOptions(
+          model,
+          firstEventAbort.signal,
+          config.sdkRequestOptions,
+        );
         emitModelTransportDebug(
           log,
           `[responses] start provider=${model.provider} api=${model.api} model=${model.id} ` +
             `baseUrl=${formatModelTransportDebugBaseUrl(model.baseUrl)} timeoutMs=${safeDebugValue(requestOptions?.timeout)} ` +
-            `apiKey=${apiKey ? "present" : "missing"} ${summarizeResponsesPayload(params)}`,
+            `apiKey=${apiKey ? "present" : "missing"} ${summarizeResponsesPayload(request)}`,
         );
-        const responseStream = await createResponsesStreamWithEncryptedContentRetry({
+        const responseStream = await config.createResponseStream({
           client,
-          request: params,
+          request,
           requestOptions,
           model,
         });
@@ -1907,13 +1935,14 @@ export function createOpenAIResponsesTransportStreamFn(): StreamFn {
         );
         stream.push({ type: "start", partial: output as never });
         await processResponsesStream(responseStream, output, stream, model, {
-          serviceTier: responsesOptions?.serviceTier,
-          applyServiceTierPricing,
-          firstEventTimeoutMs: getFirstStreamEventTimeoutMs(options),
+          serviceTier: options?.serviceTier,
+          applyServiceTierPricing: config.applyServiceTierPricing,
+          firstEventTimeoutMs:
+            getFirstStreamEventTimeoutMs(options) ?? config.defaultFirstEventTimeoutMs,
           abortFirstEventStream: firstEventAbort.abort,
           onFirstEventTimeout: getFirstStreamEventTimeoutHandler(options),
           signal: options?.signal,
-          authProfileId: responsesOptions?.authProfileId,
+          authProfileId: options?.authProfileId,
           sessionId: options?.sessionId,
         });
         if (options?.signal?.aborted) {
@@ -1922,22 +1951,31 @@ export function createOpenAIResponsesTransportStreamFn(): StreamFn {
         if (output.stopReason === "aborted" || output.stopReason === "error") {
           throw new Error("An unknown error occurred");
         }
-        stream.push({ type: "done", reason: output.stopReason as never, message: output as never });
-        stream.end();
+        finalizeTransportStream({ stream, output });
       } catch (error) {
         log.warn(
           `[responses] error provider=${model.provider} api=${model.api} model=${model.id} ` +
             summarizeOpenAITransportError(error),
         );
-        assignTransportErrorDetails(output, error, options?.signal);
-        stream.push({ type: "error", reason: output.stopReason as never, error: output as never });
-        stream.end();
+        failTransportStream({ stream, output, signal: options?.signal, error });
       } finally {
         firstEventAbort?.dispose();
       }
     })();
     return eventStream as unknown as ReturnType<StreamFn>;
   };
+}
+
+export function createOpenAIResponsesTransportStreamFn(): StreamFn {
+  return createResponsesTransportExecutor({
+    createClient: ({ model, context, apiKey, headers, turnHeaders, sessionId }) =>
+      createOpenAIResponsesClient(model, context, apiKey, headers, turnHeaders, sessionId),
+    buildRequest: ({ model, context, options, metadata }) =>
+      buildOpenAIResponsesParams(model, context, options, metadata),
+    createResponseStream: createResponsesStreamWithEncryptedContentRetry,
+    sdkRequestOptions: { stream: true },
+    applyServiceTierPricing,
+  });
 }
 
 function getPromptCacheRetention(
@@ -2219,121 +2257,25 @@ function buildOpenAIResponsesParams(
 }
 
 export function createAzureOpenAIResponsesTransportStreamFn(): StreamFn {
-  return (model, context, options) => {
-    const responsesOptions = options as OpenAIResponsesOptions | undefined;
-    const eventStream = createAssistantMessageEventStream();
-    const stream = eventStream as unknown as { push(event: unknown): void; end(): void };
-    void (async () => {
-      const output: MutableAssistantOutput = {
-        role: "assistant" as const,
-        content: [],
-        api: "azure-openai-responses",
-        provider: model.provider,
-        model: model.id,
-        usage: {
-          input: 0,
-          output: 0,
-          cacheRead: 0,
-          cacheWrite: 0,
-          totalTokens: 0,
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-        },
-        stopReason: "stop",
-        timestamp: Date.now(),
-      };
-      let firstEventAbort: ReturnType<typeof createFirstStreamEventAbortController> | undefined;
-      try {
-        const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
-        const turnState = resolveProviderTransportTurnState(model, {
-          sessionId: options?.sessionId,
-          turnId: randomUUID(),
-          attempt: 1,
-          transport: "stream",
-        });
-        const client = createAzureOpenAIClient(
-          model,
-          context,
-          apiKey,
-          options?.headers,
-          turnState?.headers,
-        );
-        const deploymentName = resolveAzureDeploymentName(model);
-        let params = buildAzureOpenAIResponsesParams(
-          model,
-          context,
-          responsesOptions,
-          deploymentName,
-          turnState?.metadata,
-        );
-        const nextParams = await options?.onPayload?.(params, model);
-        if (nextParams !== undefined) {
-          params = nextParams as typeof params;
-        }
-        if (!isOpenAICodexResponsesModel(model)) {
-          params = mergeTransportMetadata(params, turnState?.metadata);
-        }
-        params = sanitizeOpenAICodexResponsesParams(
-          model,
-          params as Record<string, unknown>,
-        ) as typeof params;
-        params = sanitizeResponsesImagePayload(params as Record<string, unknown>) as typeof params;
-        if (
-          (options as { openclawCodeModeToolSurface?: unknown } | undefined)
-            ?.openclawCodeModeToolSurface === true
-        ) {
-          enforceCodeModeResponsesToolSurface(params);
-          assertCodeModeResponsesToolSurface(params);
-        }
-        const requestStartedAt = Date.now();
-        firstEventAbort = createFirstStreamEventAbortController(options?.signal);
-        const requestOptions = buildOpenAISdkRequestOptions(model, firstEventAbort.signal);
-        emitModelTransportDebug(
-          log,
-          `[responses] start provider=${model.provider} api=${model.api} model=${model.id} ` +
-            `baseUrl=${formatModelTransportDebugBaseUrl(model.baseUrl)} timeoutMs=${safeDebugValue(requestOptions?.timeout)} ` +
-            `apiKey=${apiKey ? "present" : "missing"} ${summarizeResponsesPayload(params)}`,
-        );
-        const responseStream = (await client.responses.create(
-          params as never,
-          requestOptions,
-        )) as unknown as AsyncIterable<unknown>;
-        emitModelTransportDebug(
-          log,
-          `[responses] headers provider=${model.provider} api=${model.api} model=${model.id} ` +
-            `elapsedMs=${Date.now() - requestStartedAt}`,
-        );
-        stream.push({ type: "start", partial: output as never });
-        await processResponsesStream(responseStream, output, stream, model, {
-          firstEventTimeoutMs:
-            getFirstStreamEventTimeoutMs(options) ?? AZURE_RESPONSES_FIRST_EVENT_TIMEOUT_MS,
-          abortFirstEventStream: firstEventAbort.abort,
-          onFirstEventTimeout: getFirstStreamEventTimeoutHandler(options),
-          signal: options?.signal,
-          authProfileId: responsesOptions?.authProfileId,
-          sessionId: options?.sessionId,
-        });
-        if (options?.signal?.aborted) {
-          throw new Error("Request was aborted");
-        }
-        if (output.stopReason === "aborted" || output.stopReason === "error") {
-          throw new Error("An unknown error occurred");
-        }
-        stream.push({ type: "done", reason: output.stopReason as never, message: output as never });
-        stream.end();
-      } catch (error) {
-        log.warn(
-          `[responses] error provider=${model.provider} api=${model.api} model=${model.id} ` +
-            summarizeOpenAITransportError(error),
-        );
-        assignTransportErrorDetails(output, error, options?.signal);
-        stream.push({ type: "error", reason: output.stopReason as never, error: output as never });
-        stream.end();
-      } finally {
-        firstEventAbort?.dispose();
-      }
-    })();
-    return eventStream as unknown as ReturnType<StreamFn>;
-  };
+  return createResponsesTransportExecutor({
+    outputApi: "azure-openai-responses",
+    createClient: ({ model, context, apiKey, headers, turnHeaders }) =>
+      createAzureOpenAIClient(model, context, apiKey, headers, turnHeaders),
+    buildRequest: ({ model, context, options, metadata }) =>
+      buildAzureOpenAIResponsesParams(
+        model,
+        context,
+        options,
+        resolveAzureDeploymentName(model),
+        metadata,
+      ),
+    createResponseStream: async ({ client, request, requestOptions }) =>
+      (await client.responses.create(
+        request as never,
+        requestOptions,
+      )) as unknown as AsyncIterable<unknown>,
+    defaultFirstEventTimeoutMs: AZURE_RESPONSES_FIRST_EVENT_TIMEOUT_MS,
+  });
 }
 
 function normalizeAzureBaseUrl(baseUrl: string): string {
