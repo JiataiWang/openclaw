@@ -3,6 +3,7 @@ import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { parseStrictNonNegativeInteger } from "../../infra/parse-finite-number.js";
 import type { RuntimeEnv } from "../../runtime.js";
 import type { ChannelSetupInput } from "./setup-input.js";
+import type { ChannelSetupAdapter } from "./types.adapters.js";
 
 type ChannelSetupCliOption = {
   flags: string;
@@ -106,47 +107,7 @@ type ChannelSetupContractAdapterParams<Fields extends Record<string, ChannelSetu
       legacyAdapter: ChannelOwnedSetupAdapterShape<ChannelSetupInput>;
     };
 
-type ChannelOwnedSetupAdapterShape<Input extends { name?: string }> = {
-  resolveAccountId?: (params: { cfg: OpenClawConfig; accountId?: string; input?: Input }) => string;
-  prepareAccountConfigInput?: (params: {
-    cfg: OpenClawConfig;
-    accountId: string;
-    input: Input;
-    runtime: RuntimeEnv;
-  }) => Promise<Input> | Input;
-  resolveBindingAccountId?: (params: {
-    cfg: OpenClawConfig;
-    agentId: string;
-    accountId?: string;
-  }) => string | undefined;
-  applyAccountName?: (params: {
-    cfg: OpenClawConfig;
-    accountId: string;
-    name?: string;
-  }) => OpenClawConfig;
-  applyAccountConfig: (params: {
-    cfg: OpenClawConfig;
-    accountId: string;
-    input: Input;
-  }) => OpenClawConfig;
-  afterAccountConfigWritten?: (params: {
-    previousCfg: OpenClawConfig;
-    cfg: OpenClawConfig;
-    accountId: string;
-    input: Input;
-    runtime: RuntimeEnv;
-  }) => Promise<void> | void;
-  validateInput?: (params: {
-    cfg: OpenClawConfig;
-    accountId: string;
-    input: Input;
-  }) => string | null;
-  singleAccountKeysToMove?: readonly string[];
-  namedAccountPromotionKeys?: readonly string[];
-  resolveSingleAccountPromotionTarget?: (params: {
-    channel: Record<string, unknown>;
-  }) => string | undefined;
-};
+type ChannelOwnedSetupAdapterShape<Input extends { name?: string }> = ChannelSetupAdapter<Input>;
 
 export type ChannelOwnedSetupContract = {
   kind: "channel-owned";
